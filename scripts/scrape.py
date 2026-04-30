@@ -2,9 +2,9 @@
 """AstroNews scraper.
 
 Reads sources.md, fetches each watched URL, extracts posts via pluggable
-strategies, computes deltas vs state/seen.json, queues new posts in
-state/inbox.json, then commits and pushes. The cloud routine consumes
-inbox.json when it builds the daily digest.
+strategies, computes deltas vs state/seen.json, writes per-article metadata
+into state/articles/<sha>.json (the knowledge base), and appends new-post
+pointers into state/inbox.json for the cloud routine to drain.
 
 Designed to be portable: state lives in JSON files inside the repo, the only
 runtime dependency is Python's stdlib, and extraction strategies are stand-
@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import html as html_lib
 import json
 import re
@@ -32,6 +33,7 @@ SOURCES_FILE = REPO_ROOT / "sources.md"
 STATE_DIR = REPO_ROOT / "state"
 SEEN_FILE = STATE_DIR / "seen.json"
 INBOX_FILE = STATE_DIR / "inbox.json"
+ARTICLES_DIR = STATE_DIR / "articles"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -39,7 +41,9 @@ USER_AGENT = (
     "Version/17.0 Safari/605.1.15"
 )
 
-Post = dict  # {"url": str, "title": str, "date": str | None}
+# Post: {"url": str, "title": str, "date": str|None,
+#        "raw_excerpt": str|None, "publisher_tags": list[str]}
+Post = dict
 
 
 # --- sources.md parsing ---------------------------------------------------
@@ -75,40 +79,62 @@ def absolutize(source_url: str, href: str) -> str:
 
 # --- extraction strategies ------------------------------------------------
 
-def _decode_json_string(s: str) -> str:
-    try:
-        return json.loads(f'"{s}"')
-    except Exception:
-        return s
+def _dedupe_preserve_order(items):
+    return list(dict.fromkeys(i for i in items if i))
 
 
 def extract_embedded_json(html_text: str, source_url: str) -> list[Post]:
-    """Sites that embed posts as `{post_title, post_date, permalink}` objects.
+    """Sites that embed posts as JSON objects in HTML.
 
-    Confirmed working on a16zcrypto.com. The fields can appear in any order
-    but the regex anchors on all three keys.
+    Anchors on the `"objectID":` marker, then uses json.JSONDecoder.raw_decode
+    to parse the entire object — captures title, date, permalink, excerpt, and
+    publisher tags in one pass. Confirmed working on a16zcrypto.com.
     """
     decoded = html_lib.unescape(html_text)
-    pattern = re.compile(
-        r'"post_title":"([^"]+)"[^{}]*?"post_date":(\d+)[^{}]*?"permalink":"(/[^"]+)"'
-    )
+    decoder = json.JSONDecoder()
     seen_urls: set[str] = set()
     posts: list[Post] = []
-    for title, ts, path in pattern.findall(decoded):
+    for match in re.finditer(r'\{"objectID":', decoded):
+        try:
+            obj, _ = decoder.raw_decode(decoded[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        title = obj.get("post_title")
+        path = obj.get("permalink")
+        if not (title and path):
+            continue
         url = absolutize(source_url, path)
         if url in seen_urls:
             continue
         seen_urls.add(url)
+
+        ts = obj.get("post_date")
         try:
             date = (
                 datetime.datetime
                 .fromtimestamp(int(ts), tz=datetime.timezone.utc)
                 .date()
                 .isoformat()
-            )
+            ) if ts else None
         except Exception:
             date = None
-        posts.append({"url": url, "title": _decode_json_string(title), "date": date})
+
+        tax = obj.get("taxonomies") or {}
+        publisher_tags = _dedupe_preserve_order(
+            list(tax.get("post_tag") or []) + list(tax.get("category") or [])
+        )
+
+        excerpt = (obj.get("post_excerpt") or obj.get("post_description") or "").strip() or None
+
+        posts.append({
+            "url": url,
+            "title": title,
+            "date": date,
+            "raw_excerpt": excerpt,
+            "publisher_tags": publisher_tags,
+        })
     return posts
 
 
@@ -138,7 +164,13 @@ def extract_html_anchors(html_text: str, source_url: str) -> list[Post]:
         if url in seen_urls:
             continue
         seen_urls.add(url)
-        posts.append({"url": url, "title": title, "date": None})
+        posts.append({
+            "url": url,
+            "title": title,
+            "date": None,
+            "raw_excerpt": None,
+            "publisher_tags": [],
+        })
     return posts
 
 
@@ -149,7 +181,6 @@ EXTRACTORS: list[Callable[[str, str], list[Post]]] = [
 
 
 def extract(html_text: str, source_url: str) -> tuple[str | None, list[Post]]:
-    """Run extractors in order; return (winning_extractor_name, posts)."""
     for fn in EXTRACTORS:
         try:
             posts = fn(html_text, source_url)
@@ -159,6 +190,61 @@ def extract(html_text: str, source_url: str) -> tuple[str | None, list[Post]]:
         if posts:
             return fn.__name__, posts
     return None, []
+
+
+# --- enrichment -----------------------------------------------------------
+
+_OG_DESC_RE = re.compile(
+    r'<meta\s+[^>]*?(?:property|name)=["\']og:description["\']\s+[^>]*?content=["\']([^"\']*)["\']',
+    re.IGNORECASE,
+)
+
+
+def enrich(post: Post) -> Post:
+    """Augment a post in-place with raw_excerpt from og:description if missing.
+
+    Costs one extra HTTP fetch per post that lacks an excerpt — only called for
+    NEW posts (not seed-run posts), so cost is bounded by the publish rate of
+    the source.
+    """
+    if post.get("raw_excerpt"):
+        return post
+    try:
+        html_text = fetch(post["url"])
+    except Exception as e:  # noqa: BLE001
+        print(f"    enrich fetch failed for {post['url']}: {type(e).__name__}: {e}")
+        return post
+    m = _OG_DESC_RE.search(html_text)
+    if m:
+        post["raw_excerpt"] = html_lib.unescape(m.group(1)).strip() or None
+    return post
+
+
+# --- article cache --------------------------------------------------------
+
+def article_cache_path(url: str) -> Path:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return ARTICLES_DIR / f"{digest}.json"
+
+
+def upsert_article(post: Post, source_url: str) -> Path:
+    """Write the post into the article cache, preserving any derived fields
+    (summary, user_topics, etc.) added by other consumers."""
+    path = article_cache_path(post["url"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_json(path, {})
+    merged = {
+        **existing,
+        "url": post["url"],
+        "source_url": source_url,
+        "title": post["title"],
+        "date": post.get("date"),
+        "raw_excerpt": post.get("raw_excerpt") or existing.get("raw_excerpt"),
+        "publisher_tags": post.get("publisher_tags") or existing.get("publisher_tags") or [],
+        "fetched_at": existing.get("fetched_at") or datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    }
+    save_json(path, merged)
+    return path
 
 
 # --- JSON state ----------------------------------------------------------
@@ -227,6 +313,11 @@ def main() -> int:
             continue
         print(f"  extractor={extractor}  posts={len(posts)}")
 
+        # Always upsert each post into the article cache — idempotent, gives us
+        # a knowledge base that grows monotonically across runs.
+        for p in posts:
+            upsert_article(p, source_url)
+
         previous = set(seen.get(source_url, []))
         is_seed = source_url not in seen or not previous
         all_urls = {p["url"] for p in posts}
@@ -245,8 +336,11 @@ def main() -> int:
             summary.append(f"{source_url}: no new posts")
             continue
 
-        print(f"  {len(new_posts)} new:")
+        print(f"  {len(new_posts)} new — enriching:")
         for p in new_posts:
+            if not p.get("raw_excerpt"):
+                enrich(p)
+            upsert_article(p, source_url)  # re-upsert with enriched data
             print(f"    - {p['date'] or '????-??-??'}  {p['title'][:80]}")
             inbox.append({
                 "source_url": source_url,
@@ -263,12 +357,12 @@ def main() -> int:
     save_json(SEEN_FILE, seen)
     save_json(INBOX_FILE, inbox)
 
-    status = git("status", "--porcelain", str(SEEN_FILE), str(INBOX_FILE))
+    status = git("status", "--porcelain", "state/")
     if not status:
         print("\nNo state changes — skipping commit.")
         return 0
 
-    git("add", str(SEEN_FILE), str(INBOX_FILE))
+    git("add", "state/")
     parts = [f"{new_total} new"]
     if seeded:
         parts.append(f"{seeded} seeded")
