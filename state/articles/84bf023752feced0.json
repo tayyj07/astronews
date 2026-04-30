@@ -1,0 +1,15 @@
+{
+  "date": "2026-04-28",
+  "fetched_at": "2026-04-30T11:15:41+00:00",
+  "publisher_tags": [
+    "security",
+    "anatomy of a hack",
+    "AI agents / agentic AI",
+    "tech trends",
+    "code & engineering"
+  ],
+  "raw_excerpt": "Agents are becoming very skilled at identifying security vulnerabilities \u2014 but we wanted to find out: can they go beyond just finding vulnerabilities and actually produce working exploits on their own? We were especially curious how agents would fare against trickier test cases, because strategically complex attacks \u2014 like price manipulation, which takes advantage of...",
+  "source_url": "https://a16zcrypto.com/posts/tags/stablecoins/",
+  "title": "Can AI agents actually pull off DeFi exploits?",
+  "url": "https://a16zcrypto.com/posts/article/ai-agents-defi-exploits"
+}
