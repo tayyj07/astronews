@@ -252,7 +252,7 @@ HELP_TEXT = (
     "/retag &lt;n&gt; — re-classify a topic\n"
     "<b>Sources:</b>\n"
     "/sources — your watched URLs\n"
-    "/addsource &lt;url&gt; [→ &lt;topic&gt;] — watch a URL, optionally route under a topic\n"
+    "/addsource &lt;url&gt; [&lt;topic-n-or-text&gt;] — watch a URL; optional topic # routes under that topic\n"
     "/removesource &lt;n|url&gt; — unwatch\n"
     "<b>Other:</b>\n"
     "/help — this message\n\n"
@@ -280,14 +280,37 @@ def fmt_sources(sources: list, max_cap: int) -> str:
     return "\n".join(lines)
 
 
-def parse_addsource_arg(arg: str) -> tuple[str | None, str | None]:
-    """Split `<url> [→ <topic>]` (also accepts `->`). Returns (url, topic|None)."""
+def parse_addsource_arg(arg: str, current_topics: list[str]) -> tuple[str | None, str | None]:
+    """Parse the `/addsource` argument. Accepts:
+        <url>
+        <url> <n>                # route to topic #n from /watchlist
+        <url> <topic-text>       # route to topic by exact text
+        <url> -> <n|topic-text>  # arrow optional, both forms work
+        <url> → <n|topic-text>   # unicode arrow also fine
+    Returns (url, topic_text_or_None).
+    """
     arg = arg.strip()
+    if not arg:
+        return None, None
+    parts = arg.split(maxsplit=1)
+    url = parts[0]
+    if len(parts) == 1:
+        return url, None
+    rest = parts[1].strip()
     for sep in ("→", "->"):
-        if sep in arg:
-            url_part, topic = arg.split(sep, 1)
-            return url_part.strip(), topic.strip() or None
-    return arg or None, None
+        if rest.startswith(sep):
+            rest = rest[len(sep):].strip()
+            break
+    if not rest:
+        return url, None
+    # If the rest is a small integer, treat as a topic-number reference.
+    if rest.isdigit():
+        idx = int(rest) - 1
+        if 0 <= idx < len(current_topics):
+            return url, current_topics[idx]
+        # Number out of range — fall through; user may have meant a topic
+        # text that happens to be numeric, or the number is just wrong.
+    return url, rest
 
 
 def handle_command(token: str, conn, chat_id: int, username: str | None,
@@ -427,9 +450,14 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
     elif cmd == "/addsource":
         if not arg:
             send(token, chat_id,
-                 "Usage: <code>/addsource &lt;url&gt; [→ &lt;topic&gt;]</code>")
+                 "Usage: <code>/addsource &lt;url&gt; [&lt;topic-number-or-text&gt;]</code>\n\n"
+                 "Examples:\n"
+                 "<code>/addsource https://example.com/feed</code>\n"
+                 "<code>/addsource https://example.com/feed 3</code>  (route to topic #3)\n"
+                 "<code>/addsource https://example.com/feed bitcoin</code>")
             return
-        url, route_topic = parse_addsource_arg(arg)
+        user_topics = dbm.get_topics(conn, chat_id)
+        url, route_topic = parse_addsource_arg(arg, user_topics)
         if not url or not (url.startswith("http://") or url.startswith("https://")):
             send(token, chat_id, "URL must start with http:// or https://")
             return
@@ -439,13 +467,13 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
                  f"You're at the {dbm.MAX_SOURCES_PER_USER}-source cap. "
                  "Remove one with /removesource first.")
             return
-        # If route_topic is supplied, warn-but-accept if it isn't in user's watchlist
-        if route_topic:
-            user_topics = dbm.get_topics(conn, chat_id)
-            if not any(route_topic.lower() == t.lower() for t in user_topics):
-                send(token, chat_id,
-                     f"<i>Note:</i> &lt;{route_topic}&gt; isn't in your /watchlist. "
-                     "Posts will go under <i>Watched sources</i> until you /add it.")
+        # If route_topic was supplied as text (not a resolved number), warn if it
+        # doesn't exact-match any of the user's topics.
+        if route_topic and not any(route_topic.lower() == t.lower() for t in user_topics):
+            send(token, chat_id,
+                 f"<i>Note:</i> &lt;{route_topic}&gt; isn't in your /watchlist. "
+                 "Posts will go under <i>Watched sources</i> until you /add it.")
+            route_topic = None  # don't store a topic that doesn't match anything
         if dbm.add_user_source(conn, chat_id, url, route_topic):
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
