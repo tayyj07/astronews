@@ -4,7 +4,7 @@ Requires=astronews-scrape.service
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=4h
+OnUnitActiveSec=30min
 RandomizedDelaySec=2min
 Persistent=true
 
