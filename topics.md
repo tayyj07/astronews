@@ -4,5 +4,6 @@
 
 bitcoin
 ethereum
+hyperliquid
 solana
 stablecoins development in the tradfi space
