@@ -1,0 +1,14 @@
+[Unit]
+Description=AstroNews daily admin report — sends Telegram summary at 18:00 SGT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=astronews
+Group=astronews
+WorkingDirectory=/home/astronews/astronews
+ExecStart=/usr/bin/flock -w 60 /home/astronews/.astronews.lock /usr/bin/python3 /home/astronews/astronews/scripts/admin_report.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120

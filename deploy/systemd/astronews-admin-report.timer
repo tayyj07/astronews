@@ -1,0 +1,10 @@
+[Unit]
+Description=AstroNews admin report — daily at 18:00 SGT (10:00 UTC)
+Requires=astronews-admin-report.service
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

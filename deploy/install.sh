@@ -14,11 +14,13 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-install -m 644 "$SRC"/astronews-scrape.service  "$DEST/"
-install -m 644 "$SRC"/astronews-scrape.timer    "$DEST/"
-install -m 644 "$SRC"/astronews-notify.service  "$DEST/"
-install -m 644 "$SRC"/astronews-notify.timer    "$DEST/"
-install -m 644 "$SRC"/astronews-bot.service     "$DEST/"
+install -m 644 "$SRC"/astronews-scrape.service        "$DEST/"
+install -m 644 "$SRC"/astronews-scrape.timer          "$DEST/"
+install -m 644 "$SRC"/astronews-notify.service        "$DEST/"
+install -m 644 "$SRC"/astronews-notify.timer          "$DEST/"
+install -m 644 "$SRC"/astronews-bot.service           "$DEST/"
+install -m 644 "$SRC"/astronews-admin-report.service  "$DEST/"
+install -m 644 "$SRC"/astronews-admin-report.timer    "$DEST/"
 
 systemctl daemon-reload
 
@@ -31,6 +33,7 @@ Next steps (after the credentials file is in place and a manual test passes):
   systemctl enable --now astronews-scrape.timer
   systemctl enable --now astronews-notify.timer
   systemctl enable --now astronews-bot.service
+  systemctl enable --now astronews-admin-report.timer
   systemctl list-timers astronews-*
   systemctl status astronews-bot.service
 EOF

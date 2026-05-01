@@ -45,6 +45,7 @@ MAX_TOPICS_PER_USER = 5
 TOPIC_MAX_CHARS = 120
 DEFAULT_TOPICS = ["stablecoins"]   # auto-added to a user's watchlist on first /start
 N_SUGGESTED_TOPICS = 3             # how many popular topics to suggest in /start
+ADMIN_CHAT_IDS = {655916874}       # chat_ids allowed to run /admin commands
 TOPICS_HEADER = """\
 # Topics — auto-managed by the bot.
 # This file is the UNION of every user's active topic list.
@@ -163,7 +164,7 @@ def commit_and_push(message: str) -> tuple[bool, str]:
 
 # --- command handlers -----------------------------------------------------
 
-def fmt_watchlist(topics: list[str]) -> str:
+def fmt_watchlist(conn, chat_id: int, topics: list[str], verbose: bool = False) -> str:
     if not topics:
         return (
             "<b>Your watchlist is empty.</b>\n\n"
@@ -172,20 +173,33 @@ def fmt_watchlist(topics: list[str]) -> str:
         )
     lines = [f"<b>Your watchlist</b> ({len(topics)}/{MAX_TOPICS_PER_USER}):"]
     for i, t in enumerate(topics, 1):
-        lines.append(f"{i}. {t}")
+        if verbose:
+            inc, exc = dbm.get_facets(conn, chat_id, t)
+            tags_parts = []
+            if inc:
+                tags_parts.append("+ " + ", ".join(inc))
+            if exc:
+                tags_parts.append("− " + ", ".join(exc))
+            tags = "  <i>(" + " | ".join(tags_parts) + ")</i>" if tags_parts else "  <i>(unclassified)</i>"
+            lines.append(f"{i}. {t}{tags}")
+        else:
+            lines.append(f"{i}. {t}")
     lines += [
         "",
         "<code>/add &lt;topic&gt;</code> to add",
-        "<code>/remove &lt;number&gt;</code> or <code>/remove &lt;text&gt;</code> to remove",
+        "<code>/remove &lt;n|text&gt;</code> to remove",
+        "<code>/retag &lt;n&gt;</code> to re-classify a topic",
+        "<code>/watchlist verbose</code> to see atom tags",
     ]
     return "\n".join(lines)
 
 
 HELP_TEXT = (
     "<b>AstroNews bot — commands</b>\n"
-    "/watchlist — your topics\n"
+    "/watchlist — your topics  (<code>/watchlist verbose</code> shows atom tags)\n"
     "/add &lt;topic&gt; — add a topic\n"
-    "/remove &lt;n|text&gt; — remove by number or exact text\n"
+    "/remove &lt;n|text&gt; — remove by number or text\n"
+    "/retag &lt;n&gt; — re-classify a topic (queues for next routine fire)\n"
     "/help — this message\n\n"
     f"Cap: {MAX_TOPICS_PER_USER} topics per user.\n"
     "You'll receive a digest every 6 hours covering only your topics."
@@ -237,8 +251,9 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             send(token, chat_id, HELP_TEXT)
 
     elif cmd == "/watchlist":
+        verbose = arg.lower() in ("verbose", "v", "tags", "detail")
         topics = dbm.get_topics(conn, chat_id)
-        send(token, chat_id, fmt_watchlist(topics))
+        send(token, chat_id, fmt_watchlist(conn, chat_id, topics, verbose=verbose))
 
     elif cmd == "/add":
         if not arg:
@@ -260,7 +275,8 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
             send(token, chat_id,
-                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).")
+                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).\n"
+                 "<i>Atom classification will run in the next routine cycle (within 6h).</i>")
 
     elif cmd == "/remove":
         if not arg:
@@ -286,6 +302,65 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
             send(token, chat_id, f"Removed <i>{target}</i>.")
+
+    elif cmd == "/retag":
+        if not arg:
+            send(token, chat_id,
+                 "Usage: <code>/retag &lt;number&gt;</code> "
+                 "(use /watchlist to see numbers).")
+            return
+        current = dbm.get_topics(conn, chat_id)
+        target = None
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(current):
+                target = current[idx]
+        if target is None:
+            for t in current:
+                if t.lower() == arg.lower():
+                    target = t
+                    break
+        if target is None:
+            send(token, chat_id, "Couldn't find a matching topic.")
+            return
+        if dbm.mark_unclassified(conn, chat_id, target):
+            state_changed = True
+            dbm.refresh_user_label(conn, chat_id, username, first_name)
+            send(token, chat_id,
+                 f"Cleared classification for <i>{target}</i>. "
+                 "It will be re-classified in the next routine cycle (within 6h).")
+
+    elif cmd == "/admin":
+        if chat_id not in ADMIN_CHAT_IDS:
+            send(token, chat_id, "Admin commands are restricted.")
+            return
+        sub_parts = arg.split(maxsplit=2) if arg else []
+        sub = sub_parts[0].lower() if sub_parts else ""
+        if sub == "atoms":
+            atoms = dbm.all_atoms(conn)
+            if not atoms:
+                send(token, chat_id, "<i>No atoms yet.</i>")
+                return
+            lines = [f"<b>Atoms</b> ({len(atoms)}):"]
+            for a in atoms:
+                seed = " 🌱" if a["is_seed"] else ""
+                lines.append(f"• <code>{a['atom_id']}</code> [{a['kind']}]{seed}\n  {a['description']}")
+            send(token, chat_id, "\n".join(lines))
+        elif sub == "merge" and len(sub_parts) >= 3:
+            keep, drop = sub_parts[1].strip(), sub_parts[2].strip()
+            try:
+                n = dbm.merge_atoms(conn, keep, drop)
+                state_changed = True
+                send(token, chat_id,
+                     f"Merged <code>{drop}</code> → <code>{keep}</code> "
+                     f"({n} facet rows updated, atom <code>{drop}</code> deleted).")
+            except ValueError as e:  # noqa: BLE001
+                send(token, chat_id, f"Error: {e}")
+        else:
+            send(token, chat_id,
+                 "<b>Admin commands</b>\n"
+                 "/admin atoms — list all atoms\n"
+                 "/admin merge &lt;keep_id&gt; &lt;drop_id&gt; — merge two atoms")
 
     else:
         # Non-command messages: gentle nudge
