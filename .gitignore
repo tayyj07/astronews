@@ -6,6 +6,10 @@ __pycache__/
 state/notified.json
 # Bot's last-seen Telegram update_id — VPS-local cursor, not shared.
 state/bot_offset.txt
-# SQLite WAL/SHM sidecars — only the .db file is committed.
+# SQLite DB lives on the VPS only. Out of git so multiple writers don't have to
+# fight over binary-file merge semantics. Backed up via VPS-local snapshots if
+# we ever wire that up; for now the source of truth is /home/astronews/astronews/
+# state/astronews.db on the VPS.
+state/astronews.db
 state/astronews.db-wal
 state/astronews.db-shm
