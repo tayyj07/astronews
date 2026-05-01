@@ -7,6 +7,5 @@ claude design news
 ethereum
 hyperliquid
 solana
-stablecoin
 stablecoins
 stablecoins development in the tradfi space
