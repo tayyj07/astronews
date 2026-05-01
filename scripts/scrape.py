@@ -29,11 +29,15 @@ from pathlib import Path
 from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SOURCES_FILE = REPO_ROOT / "sources.md"
+SOURCES_FILE = REPO_ROOT / "sources.md"     # legacy file — no longer authoritative
 STATE_DIR = REPO_ROOT / "state"
 SEEN_FILE = STATE_DIR / "seen.json"
 INBOX_FILE = STATE_DIR / "inbox.json"
 ARTICLES_DIR = STATE_DIR / "articles"
+
+# Make db.py importable so we can read source URLs from the DB.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import db as dbm  # noqa: E402
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -283,9 +287,13 @@ def main() -> int:
 
     git("pull", "--rebase", "--quiet", "origin", "main")
 
-    sources = parse_sources(SOURCES_FILE.read_text())
-    if not sources:
-        print("No sources to scrape.")
+    # Sources now come from the DB (one row per unique URL across all users).
+    conn = dbm.connect()
+    dbm.init_schema(conn)
+    source_urls = dbm.all_source_urls(conn)
+    if not source_urls:
+        print("No sources subscribed by any user. Nothing to scrape.")
+        conn.close()
         return 0
 
     seen: dict[str, list[str]] = load_json(SEEN_FILE, {})
@@ -297,8 +305,8 @@ def main() -> int:
     seeded = 0
     new_total = 0
 
-    for source_url, topic in sources:
-        print(f"\n[{source_url}]  topic={topic!r}")
+    for source_url in source_urls:
+        print(f"\n[{source_url}]")
         try:
             html_text = fetch(source_url)
         except Exception as e:  # noqa: BLE001
@@ -327,6 +335,10 @@ def main() -> int:
             seen[source_url] = sorted(all_urls)
             seeded += 1
             summary.append(f"{source_url}: seeded ({len(all_urls)} posts)")
+            try:
+                dbm.mark_source_scraped(conn, source_url)
+            except Exception:  # noqa: BLE001
+                pass
             continue
 
         new_posts = [p for p in posts if p["url"] not in previous]
@@ -334,6 +346,10 @@ def main() -> int:
             print("  No new posts.")
             seen[source_url] = sorted(previous | all_urls)
             summary.append(f"{source_url}: no new posts")
+            try:
+                dbm.mark_source_scraped(conn, source_url)
+            except Exception:  # noqa: BLE001
+                pass
             continue
 
         print(f"  {len(new_posts)} new — enriching:")
@@ -342,9 +358,11 @@ def main() -> int:
                 enrich(p)
             upsert_article(p, source_url)  # re-upsert with enriched data
             print(f"    - {p['date'] or '????-??-??'}  {p['title'][:80]}")
+            # Inbox items no longer carry a per-user `topic` field — routing
+            # happens at notifier time via user_sources lookup, since each
+            # follower of a source URL may want a different topic mapping.
             inbox.append({
                 "source_url": source_url,
-                "topic": topic,
                 "url": p["url"],
                 "title": p["title"],
                 "date": p["date"],
@@ -353,9 +371,15 @@ def main() -> int:
         seen[source_url] = sorted(previous | all_urls)
         new_total += len(new_posts)
         summary.append(f"{source_url}: {len(new_posts)} new")
+        # Stamp the last-scraped time on the source row so admin can audit
+        try:
+            dbm.mark_source_scraped(conn, source_url)
+        except Exception:  # noqa: BLE001
+            pass
 
     save_json(SEEN_FILE, seen)
     save_json(INBOX_FILE, inbox)
+    conn.close()
 
     status = git("status", "--porcelain", "state/")
     if not status:
@@ -366,7 +390,7 @@ def main() -> int:
     parts = [f"{new_total} new"]
     if seeded:
         parts.append(f"{seeded} seeded")
-    msg = f"scraper: {', '.join(parts)} across {len(sources)} source(s)"
+    msg = f"scraper: {', '.join(parts)} across {len(source_urls)} source(s)"
     git(
         "-c", "user.name=AstroNews Scraper",
         "-c", "user.email=astronews-scraper@users.noreply.github.com",

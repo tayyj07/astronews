@@ -245,14 +245,49 @@ def fmt_watchlist(conn, chat_id: int, topics: list[str], verbose: bool = False) 
 
 HELP_TEXT = (
     "<b>AstroNews bot — commands</b>\n"
+    "<b>Topics:</b>\n"
     "/watchlist — your topics  (<code>/watchlist verbose</code> shows atom tags)\n"
     "/add &lt;topic&gt; — add a topic\n"
     "/remove &lt;n|text&gt; — remove by number or text\n"
-    "/retag &lt;n&gt; — re-classify a topic (queues for next routine fire)\n"
+    "/retag &lt;n&gt; — re-classify a topic\n"
+    "<b>Sources:</b>\n"
+    "/sources — your watched URLs\n"
+    "/addsource &lt;url&gt; [→ &lt;topic&gt;] — watch a URL, optionally route under a topic\n"
+    "/removesource &lt;n|url&gt; — unwatch\n"
+    "<b>Other:</b>\n"
     "/help — this message\n\n"
-    f"Cap: {MAX_TOPICS_PER_USER} topics per user.\n"
-    "You'll receive a digest every 6 hours covering only your topics."
+    f"Caps: {MAX_TOPICS_PER_USER} topics, {dbm.MAX_SOURCES_PER_USER} sources per user.\n"
+    "You'll receive a digest every 6 hours."
 )
+
+
+def fmt_sources(sources: list, max_cap: int) -> str:
+    if not sources:
+        return (
+            "<b>No watched sources yet.</b>\n\n"
+            "Add a URL with <code>/addsource &lt;url&gt;</code> "
+            "or <code>/addsource &lt;url&gt; → &lt;topic&gt;</code> to route under one of your topics."
+        )
+    lines = [f"<b>Watched sources</b> ({len(sources)}/{max_cap}):"]
+    for i, s in enumerate(sources, 1):
+        topic = s["topic"] or "—"
+        lines.append(f"{i}. {s['source_url']}\n    <i>routes to:</i> {topic}")
+    lines += [
+        "",
+        "<code>/addsource &lt;url&gt; [→ &lt;topic&gt;]</code> to add",
+        "<code>/removesource &lt;n|url&gt;</code> to remove",
+    ]
+    return "\n".join(lines)
+
+
+def parse_addsource_arg(arg: str) -> tuple[str | None, str | None]:
+    """Split `<url> [→ <topic>]` (also accepts `->`). Returns (url, topic|None)."""
+    arg = arg.strip()
+    for sep in ("→", "->"):
+        if sep in arg:
+            url_part, topic = arg.split(sep, 1)
+            return url_part.strip(), topic.strip() or None
+    return arg or None, None
 
 
 def handle_command(token: str, conn, chat_id: int, username: str | None,
@@ -384,6 +419,66 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
                 send(token, chat_id,
                      f"Cleared classification for <i>{target}</i>. "
                      "Will re-classify on the next 15-min cycle.")
+
+    elif cmd == "/sources":
+        sources = list(dbm.get_user_sources(conn, chat_id))
+        send(token, chat_id, fmt_sources(sources, dbm.MAX_SOURCES_PER_USER))
+
+    elif cmd == "/addsource":
+        if not arg:
+            send(token, chat_id,
+                 "Usage: <code>/addsource &lt;url&gt; [→ &lt;topic&gt;]</code>")
+            return
+        url, route_topic = parse_addsource_arg(arg)
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            send(token, chat_id, "URL must start with http:// or https://")
+            return
+        current = list(dbm.get_user_sources(conn, chat_id))
+        if len(current) >= dbm.MAX_SOURCES_PER_USER:
+            send(token, chat_id,
+                 f"You're at the {dbm.MAX_SOURCES_PER_USER}-source cap. "
+                 "Remove one with /removesource first.")
+            return
+        # If route_topic is supplied, warn-but-accept if it isn't in user's watchlist
+        if route_topic:
+            user_topics = dbm.get_topics(conn, chat_id)
+            if not any(route_topic.lower() == t.lower() for t in user_topics):
+                send(token, chat_id,
+                     f"<i>Note:</i> &lt;{route_topic}&gt; isn't in your /watchlist. "
+                     "Posts will go under <i>Watched sources</i> until you /add it.")
+        if dbm.add_user_source(conn, chat_id, url, route_topic):
+            state_changed = True
+            dbm.refresh_user_label(conn, chat_id, username, first_name)
+            tail = f" routed under <i>{route_topic}</i>" if route_topic else ""
+            send(token, chat_id,
+                 f"Watching <code>{url}</code>{tail}. Scraper picks it up within 30 min.")
+        else:
+            send(token, chat_id, f"You're already watching that URL.")
+
+    elif cmd == "/removesource":
+        if not arg:
+            send(token, chat_id,
+                 "Usage: <code>/removesource &lt;number&gt;</code> "
+                 "or <code>/removesource &lt;url&gt;</code>")
+            return
+        current = list(dbm.get_user_sources(conn, chat_id))
+        target = None
+        if arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(current):
+                target = current[idx]["source_url"]
+        if target is None:
+            for s in current:
+                if s["source_url"].lower() == arg.lower():
+                    target = s["source_url"]
+                    break
+        if target is None:
+            send(token, chat_id, "Couldn't find a matching source.")
+            return
+        if dbm.remove_user_source(conn, chat_id, target):
+            state_changed = True
+            dbm.refresh_user_label(conn, chat_id, username, first_name)
+            send(token, chat_id, f"Stopped watching <code>{target}</code>.")
 
     elif cmd == "/admin":
         if chat_id not in ADMIN_CHAT_IDS:

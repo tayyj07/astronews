@@ -33,6 +33,7 @@ import db as dbm  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DIGESTS_DIR = REPO_ROOT / "digests"
+INBOX_FILE = REPO_ROOT / "state" / "inbox.json"
 CREDENTIALS_FILE = Path(os.path.expanduser("~/.config/astronews/credentials.env"))
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
@@ -105,39 +106,103 @@ def has_substantive_bullet(body: list[str]) -> bool:
     return any(line.lstrip().startswith("- ") for line in body)
 
 
+def _domain_to_outlet(url: str) -> str:
+    """Derive a human-friendly outlet label from a URL's hostname."""
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:  # noqa: BLE001
+        host = ""
+    host = host.removeprefix("www.")
+    parts = host.split(".")
+    name = parts[0] if parts else "source"
+    # Title-case but keep common acronyms uppercase
+    return name.replace("-", " ").title() or "Source"
+
+
+def _format_inbox_bullet(item: dict) -> str:
+    """Render an inbox item as a markdown bullet with source-first formatting."""
+    url = item["url"]
+    title = (item.get("title") or "").strip() or "(no title)"
+    date = item.get("date")
+    outlet = _domain_to_outlet(url)
+    date_prefix = f"[{date}] " if date else ""
+    return f"- {date_prefix}{title}. ([{outlet}]({url}))"
+
+
 def build_user_view(h1: str, sections: list[tuple[str, list[str]]],
                     user_topics: list[str], seen_urls: set[str],
-                    ) -> tuple[str | None, list[str]]:
-    """Build a per-user filtered digest. Returns (md, surfaced_urls).
-    Returns (None, []) if there's no substantive content for the user.
+                    user_sources_map: dict[str, str | None],
+                    inbox: list[dict],
+                    ) -> tuple[str | None, list[str], list[str]]:
+    """Build a per-user filtered digest. Returns (md, surfaced_urls, inbox_consumed_urls).
+
+    - `user_topics`: the user's topic strings.
+    - `user_sources_map`: {source_url: route_topic_or_None} — the user's source subscriptions.
+    - `inbox`: list of inbox items the scraper queued globally; we filter to this user's sources.
+
+    Returns (None, [], []) if there's no substantive content for the user.
     """
     topic_lookup = {t.lower(): t for t in user_topics}
-    output: list[str] = [f"# {h1}"] if h1 else []
     surfaced: list[str] = []
+    inbox_consumed: list[str] = []
     any_content = False
 
+    # Step 1: collect bullets from the global digest's H2 sections that match
+    # this user's topics.
+    topic_blocks: dict[str, list[str]] = {}
     for heading, body in sections:
         if heading.lower() not in topic_lookup:
             continue
         filtered = filter_bullets(body, seen_urls)
-        # strip leading/trailing empty lines from the section body
         while filtered and not filtered[0].strip():
             filtered.pop(0)
         while filtered and not filtered[-1].strip():
             filtered.pop()
+        canonical = topic_lookup[heading.lower()]
+        topic_blocks.setdefault(canonical, []).extend(filtered)
+
+    # Step 2: pull inbox items the user follows; route by their user_sources topic.
+    watched_sources_bullets: list[str] = []
+    for item in inbox:
+        src = item.get("source_url")
+        if src not in user_sources_map:
+            continue  # user doesn't follow this source
+        if item["url"] in seen_urls:
+            continue  # already delivered to this user
+        bullet = _format_inbox_bullet(item)
+        route = user_sources_map[src]
+        if route and route.lower() in topic_lookup:
+            topic_blocks.setdefault(topic_lookup[route.lower()], []).append(bullet)
+        else:
+            watched_sources_bullets.append(bullet)
+        surfaced.append(item["url"])
+        inbox_consumed.append(item["url"])
+
+    # Step 3: assemble the user's view.
+    output: list[str] = [f"# {h1}"] if h1 else []
+    for topic in user_topics:
+        block = topic_blocks.get(topic, [])
         output.append("")
-        output.append(f"## {heading}")
-        if has_substantive_bullet(filtered):
+        output.append(f"## {topic}")
+        if has_substantive_bullet(block):
             any_content = True
-            output.extend(filtered)
-            for line in filtered:
+            output.extend(block)
+            for line in block:
                 surfaced.extend(bullet_urls(line))
         else:
             output.append("_No new material in the last 6 hours._")
 
+    if watched_sources_bullets:
+        any_content = True
+        output.append("")
+        output.append("## Watched sources")
+        output.extend(watched_sources_bullets)
+
     if not any_content:
-        return None, []
-    return "\n".join(output).rstrip() + "\n", list(dict.fromkeys(surfaced))
+        return None, [], []
+    return ("\n".join(output).rstrip() + "\n",
+            list(dict.fromkeys(surfaced)),
+            list(dict.fromkeys(inbox_consumed)))
 
 
 # --- markdown → Telegram HTML --------------------------------------------
@@ -263,6 +328,43 @@ def git(*args: str) -> tuple[int, str, str]:
     return res.returncode, res.stdout.strip(), res.stderr.strip()
 
 
+def _load_inbox() -> list[dict]:
+    if not INBOX_FILE.exists():
+        return []
+    try:
+        data = json.loads(INBOX_FILE.read_text())
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _drain_inbox(conn, original_inbox: list[dict]) -> None:
+    """Remove inbox items whose URL has been delivered to every current
+    follower of the source. Anything still pending stays in the inbox.
+    Re-reads the inbox from disk so concurrent scraper appends aren't lost.
+    """
+    current = _load_inbox()
+    by_url = {item["url"]: item for item in current}
+    surviving: list[dict] = []
+    for url, item in by_url.items():
+        src = item.get("source_url")
+        if not src:
+            surviving.append(item)
+            continue
+        followers = dbm.followers_of_source(conn, src)
+        if not followers:
+            continue  # no one cares anymore — drop it
+        all_seen = all(
+            dbm.has_seen_url(conn, f["chat_id"], url) for f in followers
+        )
+        if not all_seen:
+            surviving.append(item)
+    if len(surviving) != len(current):
+        INBOX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INBOX_FILE.write_text(json.dumps(surviving, indent=2, sort_keys=True) + "\n")
+        print(f"inbox drained: kept {len(surviving)} of {len(current)}")
+
+
 # --- main -----------------------------------------------------------------
 
 def main() -> int:
@@ -294,11 +396,15 @@ def main() -> int:
         h1, sections = parse_digest(path.read_text())
         parsed_digests.append((path, h1, sections))
 
+    inbox = _load_inbox()
+
     sent_count = 0
     for user in users:
         chat_id = user["chat_id"]
         topics = dbm.get_topics(conn, chat_id)
-        if not topics:
+        user_src_rows = dbm.get_user_sources(conn, chat_id)
+        user_sources_map = {r["source_url"]: r["topic"] for r in user_src_rows}
+        if not topics and not user_sources_map:
             continue
         for path, h1, sections in parsed_digests:
             if dbm.has_been_notified(conn, chat_id, path.name):
@@ -309,9 +415,10 @@ def main() -> int:
                     (chat_id,),
                 )
             }
-            md_view, surfaced = build_user_view(h1, sections, topics, seen)
+            md_view, surfaced, _ = build_user_view(
+                h1, sections, topics, seen, user_sources_map, inbox,
+            )
             if md_view is None:
-                # No relevant content for this user; mark as notified and move on.
                 dbm.record_notified(conn, chat_id, path.name)
                 continue
             html_body = md_to_telegram_html(md_view)
@@ -334,6 +441,9 @@ def main() -> int:
                 dbm.record_notified(conn, chat_id, path.name)
                 dbm.record_seen_urls(conn, chat_id, surfaced)
                 sent_count += 1
+
+    # Drain inbox: keep items only while at least one follower hasn't seen them.
+    _drain_inbox(conn, inbox)
 
     pruned = dbm.prune_old_digested(conn)
     if pruned:

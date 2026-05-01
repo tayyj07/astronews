@@ -24,8 +24,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = REPO_ROOT / "state" / "astronews.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEDUP_KEEP_DAYS = 7
+MAX_SOURCES_PER_USER = 5
 
 
 SCHEMA_SQL = """
@@ -105,6 +106,27 @@ CREATE TABLE IF NOT EXISTS topic_facets (
     FOREIGN KEY (atom_id) REFERENCES atoms(atom_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_topic_facets_atom ON topic_facets(atom_id);
+
+-- Watched sources. One row per unique source URL across all users (dedup),
+-- scraped once regardless of how many users follow it.
+CREATE TABLE IF NOT EXISTS sources (
+    source_url       TEXT PRIMARY KEY,
+    added_at         TEXT NOT NULL,
+    last_scraped_at  TEXT
+);
+
+-- Per-user subscription to a source URL, with optional `topic` for routing
+-- the source's posts under one of the user's existing topic H2s.
+CREATE TABLE IF NOT EXISTS user_sources (
+    chat_id     INTEGER NOT NULL,
+    source_url  TEXT NOT NULL,
+    topic       TEXT,                          -- nullable; null → goes under ## Watched sources
+    added_at    TEXT NOT NULL,
+    PRIMARY KEY (chat_id, source_url),
+    FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+    FOREIGN KEY (source_url) REFERENCES sources(source_url) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_user_sources_url ON user_sources(source_url);
 """
 
 
@@ -141,6 +163,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if row is None:
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
     elif row["version"] < SCHEMA_VERSION:
+        # v2 → v3: sources + user_sources tables already created above via
+        # CREATE TABLE IF NOT EXISTS. Just bump the version marker.
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
 
@@ -417,6 +441,89 @@ def topic_events_since(conn: sqlite3.Connection, since_iso: str
         (since_iso,),
     ).fetchall()
 
+
+# --- sources + user_sources ----------------------------------------------
+
+def all_source_urls(conn: sqlite3.Connection) -> list[str]:
+    """Every unique source URL across all users — what the scraper iterates over."""
+    rows = conn.execute(
+        "SELECT source_url FROM sources ORDER BY source_url"
+    ).fetchall()
+    return [r["source_url"] for r in rows]
+
+
+def get_user_sources(conn: sqlite3.Connection, chat_id: int) -> list[sqlite3.Row]:
+    """Each row: (source_url, topic, added_at) for one user."""
+    return conn.execute(
+        "SELECT source_url, topic, added_at FROM user_sources "
+        "WHERE chat_id = ? ORDER BY added_at",
+        (chat_id,),
+    ).fetchall()
+
+
+def add_user_source(conn: sqlite3.Connection, chat_id: int, source_url: str,
+                    topic: str | None = None) -> bool:
+    """Subscribe a user to a source URL. Returns True if newly subscribed,
+    False if the user was already subscribed.
+
+    Inserts the source URL into the global `sources` table if it isn't there
+    yet (so two users adding the same URL only causes one scrape per fire).
+    """
+    now = now_utc()
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (source_url, added_at) VALUES (?, ?)",
+        (source_url, now),
+    )
+    try:
+        conn.execute(
+            "INSERT INTO user_sources (chat_id, source_url, topic, added_at) "
+            "VALUES (?, ?, ?, ?)",
+            (chat_id, source_url, topic, now),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def remove_user_source(conn: sqlite3.Connection, chat_id: int,
+                       source_url: str) -> bool:
+    """Unsubscribe a user. If no other user follows the URL, drop it from
+    `sources` too so the scraper stops fetching it. Returns True if the
+    user_sources row existed."""
+    cur = conn.execute(
+        "DELETE FROM user_sources WHERE chat_id = ? AND source_url = ?",
+        (chat_id, source_url),
+    )
+    if cur.rowcount == 0:
+        return False
+    # Cleanup: drop the source globally if no one else subscribes
+    remaining = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_sources WHERE source_url = ?",
+        (source_url,),
+    ).fetchone()
+    if remaining and remaining["c"] == 0:
+        conn.execute("DELETE FROM sources WHERE source_url = ?", (source_url,))
+    return True
+
+
+def followers_of_source(conn: sqlite3.Connection, source_url: str
+                        ) -> list[sqlite3.Row]:
+    """For the notifier — who follows this source URL, and what topic do they
+    want posts routed under?"""
+    return conn.execute(
+        "SELECT chat_id, topic FROM user_sources WHERE source_url = ?",
+        (source_url,),
+    ).fetchall()
+
+
+def mark_source_scraped(conn: sqlite3.Connection, source_url: str) -> None:
+    conn.execute(
+        "UPDATE sources SET last_scraped_at = ? WHERE source_url = ?",
+        (now_utc(), source_url),
+    )
+
+
+# --- atoms (continued) ---------------------------------------------------
 
 def merge_atoms(conn: sqlite3.Connection, keep_id: str, drop_id: str) -> int:
     """Repoint all topic_facets from drop_id to keep_id, then delete drop_id.
