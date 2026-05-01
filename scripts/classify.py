@@ -126,12 +126,48 @@ def classify_topic(client, topic: str, atoms: list) -> dict:
     return parse_response_json(text)
 
 
-def main() -> int:
+def get_client():
+    """Return an anthropic.Anthropic client using the credentials file.
+    Raises if the SDK or key is missing."""
     api_key = load_api_key()
     os.environ["ANTHROPIC_API_KEY"] = api_key
-    import anthropic  # imported here so the script fails fast if env is missing
-    client = anthropic.Anthropic()
+    import anthropic  # noqa: PLC0415
+    return anthropic.Anthropic()
 
+
+def classify_and_persist(conn, client, chat_id: int, topic: str) -> dict:
+    """Classify ONE topic and write the results to the DB. Returns a dict:
+        {"include": [...], "exclude": [...], "new_atoms": [atom_id, ...],
+         "rationale": "..."}
+    The caller is expected to be holding the flock and to have already
+    inserted the user_topics row."""
+    atoms = [dict(r) for r in dbm.all_atoms(conn)]
+    result = classify_topic(client, topic, atoms)
+
+    include = result.get("include_atoms", []) or []
+    exclude = result.get("exclude_atoms", []) or []
+    rationale = result.get("rationale", "") or ""
+    new_atom_ids: list[str] = []
+    for new_atom in result.get("new_atoms", []) or []:
+        aid = new_atom.get("atom_id")
+        kind = new_atom.get("kind", "other")
+        desc = new_atom.get("description", "")
+        if not aid:
+            continue
+        if dbm.upsert_atom(conn, aid, kind, desc, created_by=chat_id):
+            new_atom_ids.append(aid)
+
+    dbm.set_facets(conn, chat_id, topic, include, exclude, rationale)
+    return {
+        "include": include,
+        "exclude": exclude,
+        "new_atoms": new_atom_ids,
+        "rationale": rationale,
+    }
+
+
+def main() -> int:
+    client = get_client()
     with repo_lock():
         conn = dbm.connect()
         dbm.init_schema(conn)
@@ -143,8 +179,7 @@ def main() -> int:
             return 0
 
         unclassified = unclassified[:MAX_TOPICS_PER_RUN]
-        atoms = [dict(r) for r in dbm.all_atoms(conn)]
-        print(f"Classifying {len(unclassified)} topic(s); known atoms: {len(atoms)}")
+        print(f"Classifying {len(unclassified)} topic(s)")
 
         new_atom_ids: set[str] = set()
         classified_count = 0
@@ -155,29 +190,15 @@ def main() -> int:
             topic = row["topic"]
             print(f"  → {chat_id} / {topic!r}")
             try:
-                result = classify_topic(client, topic, atoms)
+                info = classify_and_persist(conn, client, chat_id, topic)
             except Exception as e:  # noqa: BLE001
                 msg = f"{type(e).__name__}: {e}"
                 print(f"    classify failed: {msg}")
                 errors.append(f"{topic}: {msg}")
                 continue
-
-            include = result.get("include_atoms", [])
-            exclude = result.get("exclude_atoms", [])
-            rationale = result.get("rationale", "")
-            for new_atom in result.get("new_atoms", []):
-                aid = new_atom.get("atom_id")
-                kind = new_atom.get("kind", "other")
-                desc = new_atom.get("description", "")
-                if not aid:
-                    continue
-                if dbm.upsert_atom(conn, aid, kind, desc, created_by=chat_id):
-                    new_atom_ids.add(aid)
-                    atoms.append({"atom_id": aid, "kind": kind, "description": desc})
-
-            dbm.set_facets(conn, chat_id, topic, include, exclude, rationale)
+            new_atom_ids.update(info["new_atoms"])
             classified_count += 1
-            print(f"    include={include} exclude={exclude}  ({rationale[:80]})")
+            print(f"    include={info['include']} exclude={info['exclude']}  ({info['rationale'][:80]})")
 
         conn.close()
 

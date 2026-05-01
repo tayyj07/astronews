@@ -33,6 +33,55 @@ from pathlib import Path
 # Make sibling modules importable even when run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db as dbm  # noqa: E402
+import classify as classifier  # noqa: E402
+
+# Lazily-initialised Anthropic client. Allowed to fail at startup — synchronous
+# /add classification then degrades to "Added" without atom info, and the
+# 15-min systemd timer picks the topic up later.
+_anthropic_client = None
+_anthropic_client_error: str | None = None
+
+
+def get_anthropic_client():
+    global _anthropic_client, _anthropic_client_error
+    if _anthropic_client is not None:
+        return _anthropic_client
+    if _anthropic_client_error is not None:
+        return None
+    try:
+        _anthropic_client = classifier.get_client()
+        return _anthropic_client
+    except Exception as e:  # noqa: BLE001
+        _anthropic_client_error = f"{type(e).__name__}: {e}"
+        print(f"anthropic client init failed: {_anthropic_client_error}", file=sys.stderr)
+        return None
+
+
+def classify_inline(conn, chat_id: int, topic: str) -> dict | None:
+    """Classify a topic synchronously. Returns the result dict on success,
+    None on any failure (caller should fall back to a generic message)."""
+    client = get_anthropic_client()
+    if client is None:
+        return None
+    try:
+        return classifier.classify_and_persist(conn, client, chat_id, topic)
+    except Exception as e:  # noqa: BLE001
+        print(f"inline classify failed for {chat_id}/{topic!r}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return None
+
+
+def fmt_atoms_inline(info: dict) -> str:
+    """Render the classify result as a short suffix for the bot reply."""
+    parts = []
+    if info["include"]:
+        parts.append("+ " + ", ".join(info["include"]))
+    if info["exclude"]:
+        parts.append("− " + ", ".join(info["exclude"]))
+    tail = ""
+    if info["new_atoms"]:
+        tail = f" <i>(new: {', '.join(info['new_atoms'])})</i>"
+    return ("  <i>(" + " | ".join(parts) + ")</i>" + tail) if parts else ""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOPICS_FILE = REPO_ROOT / "topics.md"
@@ -274,8 +323,10 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
         if dbm.add_topic(conn, chat_id, arg):
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
+            info = classify_inline(conn, chat_id, arg)
+            atom_suffix = fmt_atoms_inline(info) if info else ""
             send(token, chat_id,
-                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).")
+                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).{atom_suffix}")
 
     elif cmd == "/remove":
         if not arg:
@@ -325,9 +376,14 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
         if dbm.mark_unclassified(conn, chat_id, target):
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
-            send(token, chat_id,
-                 f"Cleared classification for <i>{target}</i>. "
-                 "It will be re-classified in the next routine cycle (within 6h).")
+            info = classify_inline(conn, chat_id, target)
+            atom_suffix = fmt_atoms_inline(info) if info else ""
+            if info:
+                send(token, chat_id, f"Re-classified <i>{target}</i>.{atom_suffix}")
+            else:
+                send(token, chat_id,
+                     f"Cleared classification for <i>{target}</i>. "
+                     "Will re-classify on the next 15-min cycle.")
 
     elif cmd == "/admin":
         if chat_id not in ADMIN_CHAT_IDS:
