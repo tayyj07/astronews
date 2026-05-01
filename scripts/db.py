@@ -123,21 +123,24 @@ def connect() -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA_SQL)
-    row = conn.execute("SELECT version FROM schema_version").fetchone()
-    current = row["version"] if row else 0
-    if row is None:
-        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-        return
-    # Migration v1 → v2: add classified_at + classification_rationale columns
-    # to user_topics for older DBs. atoms + topic_facets tables are created
-    # idempotently above via CREATE TABLE IF NOT EXISTS.
-    if current < 2:
+    # Pre-migration: add columns to user_topics if upgrading from v1, BEFORE
+    # the schema script runs (which references classified_at in a partial index).
+    has_user_topics = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='user_topics'"
+    ).fetchone() is not None
+    if has_user_topics:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(user_topics)")}
         if "classified_at" not in cols:
             conn.execute("ALTER TABLE user_topics ADD COLUMN classified_at TEXT")
         if "classification_rationale" not in cols:
             conn.execute("ALTER TABLE user_topics ADD COLUMN classification_rationale TEXT")
+
+    conn.executescript(SCHEMA_SQL)
+
+    row = conn.execute("SELECT version FROM schema_version").fetchone()
+    if row is None:
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+    elif row["version"] < SCHEMA_VERSION:
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
 
