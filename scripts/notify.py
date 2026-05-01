@@ -55,14 +55,37 @@ def load_credentials() -> dict:
 
 # --- markdown → Telegram HTML ---------------------------------------------
 
+_BULLET_SOURCE_RE = re.compile(
+    r'^(\s*-)\s+(.+?)\s*\(\[([^\]]+)\]\(([^)]+)\)\)\s*$',
+    re.MULTILINE,
+)
+
+
+def reformat_source_first(md: str) -> str:
+    """Move the trailing ([Source](url)) on each bullet to the front.
+
+    Input:   `- BIP-361 ... at risk. ([Coindesk](https://...))`
+    Output:  `- ([Coindesk](https://...)) BIP-361 ... at risk.`
+
+    After HTML conversion the source becomes a parenthesized clickable link
+    at the start of the bullet, matching the user's preferred layout.
+    """
+    def repl(m: re.Match) -> str:
+        prefix, text, source, url = m.group(1), m.group(2).rstrip(), m.group(3), m.group(4)
+        return f'{prefix} ([{source}]({url})) {text}'
+    return _BULLET_SOURCE_RE.sub(repl, md)
+
+
 def md_to_telegram_html(md: str) -> str:
     """Convert the digest markdown to Telegram-flavored HTML.
 
     Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a>. No headings.
-    We map H1/H2 to <b>, bullets to "• ", and links to <a>.
+    We map H1/H2 to <b>, bullets to "• ", and links to <a>. Bullets get
+    their source link moved to the start (parenthesized).
     """
+    md = reformat_source_first(md)
     text = html.escape(md, quote=False)
-    # Headings → bold + newline
+    # Headings → bold (H1/H2/H3 all become <b>)
     text = re.sub(r"^#{1,3}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     # **bold**
     text = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", text)
@@ -75,40 +98,98 @@ def md_to_telegram_html(md: str) -> str:
     return text
 
 
-def split_for_telegram(text: str, limit: int = SAFE_CHUNK) -> list[str]:
-    """Split text into chunks that fit Telegram's 4096-char message limit.
+def _is_heading(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("<b>") and s.endswith("</b>")
 
-    Splits on paragraph boundaries (\n\n). If a single paragraph exceeds the
-    limit, falls through to a hard char-cut on that paragraph.
+
+def split_for_telegram(text: str, limit: int = SAFE_CHUNK) -> list[str]:
+    """Split text into messages, keeping each topic-section (H2 and its
+    bullets) in one message whenever possible.
+
+    Algorithm:
+    1. Parse into blocks. A block = a heading line followed by its body
+       (lines up to the next heading). Blocks are kept atomic during packing.
+    2. Greedy-pack blocks into messages: each block starts in a new message
+       if it doesn't fit alongside what's already accumulated.
+    3. If a single block exceeds the per-message limit, split its body across
+       messages but reprise the heading at the start of each chunk so the
+       reader always knows which topic they're inside.
     """
     if len(text.encode("utf-8")) <= limit:
         return [text]
-    chunks: list[str] = []
+
+    # --- step 1: collect blocks
+    blocks: list[list[str]] = []
     current: list[str] = []
-    current_size = 0
-    for para in text.split("\n\n"):
-        para_size = len((para + "\n\n").encode("utf-8"))
-        if para_size > limit:
-            # Flush whatever we have first
+    for line in text.split("\n"):
+        if _is_heading(line):
             if current:
-                chunks.append("\n\n".join(current))
-                current = []
-                current_size = 0
-            # Hard-cut the oversized paragraph
-            data = para.encode("utf-8")
-            for i in range(0, len(data), limit):
-                chunks.append(data[i:i + limit].decode("utf-8", errors="ignore"))
-            continue
-        if current_size + para_size > limit and current:
-            chunks.append("\n\n".join(current))
-            current = [para]
-            current_size = para_size
+                blocks.append(current)
+            current = [line]
         else:
-            current.append(para)
-            current_size += para_size
+            if not current:
+                current = []
+            current.append(line)
     if current:
-        chunks.append("\n\n".join(current))
-    return chunks
+        blocks.append(current)
+
+    # --- step 2: pack blocks
+    messages: list[str] = []
+    msg: list[str] = []
+    msg_size = 0
+    sep = "\n\n"
+    sep_bytes = len(sep.encode("utf-8"))
+
+    def block_text(b: list[str]) -> str:
+        return "\n".join(b).rstrip()
+
+    def flush_msg() -> None:
+        nonlocal msg, msg_size
+        if msg:
+            messages.append(sep.join(msg))
+            msg = []
+            msg_size = 0
+
+    for block in blocks:
+        text_b = block_text(block)
+        if not text_b:
+            continue
+        b_size = len(text_b.encode("utf-8")) + (sep_bytes if msg else 0)
+
+        if b_size > limit:
+            # Oversized block: flush current msg, then split this block with
+            # heading repetition.
+            flush_msg()
+            heading = block[0] if block and _is_heading(block[0]) else ""
+            body = block[1:] if heading else block
+            heading_size = len(heading.encode("utf-8")) + 1 if heading else 0
+
+            sub: list[str] = [heading] if heading else []
+            sub_size = heading_size
+
+            for line in body:
+                line_size = len(line.encode("utf-8")) + 1
+                projected = sub_size + line_size
+                # Only flush if we already have body content (not just heading)
+                if projected > limit and len(sub) > (1 if heading else 0):
+                    messages.append("\n".join(sub))
+                    sub = [heading] if heading else []
+                    sub_size = heading_size
+                sub.append(line)
+                sub_size += line_size
+            if sub and (len(sub) > (1 if heading else 0) or not heading):
+                messages.append("\n".join(sub))
+        elif msg_size + b_size > limit:
+            flush_msg()
+            msg = [text_b]
+            msg_size = len(text_b.encode("utf-8"))
+        else:
+            msg.append(text_b)
+            msg_size += b_size
+
+    flush_msg()
+    return messages
 
 
 def send_message(token: str, chat_id: str, text: str) -> dict:
