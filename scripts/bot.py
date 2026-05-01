@@ -43,6 +43,8 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 LONG_POLL_TIMEOUT = 25     # seconds
 MAX_TOPICS_PER_USER = 5
 TOPIC_MAX_CHARS = 120
+DEFAULT_TOPICS = ["stablecoins"]   # auto-added to a user's watchlist on first /start
+N_SUGGESTED_TOPICS = 3             # how many popular topics to suggest in /start
 TOPICS_HEADER = """\
 # Topics — auto-managed by the bot.
 # This file is the UNION of every user's active topic list.
@@ -205,14 +207,34 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
     state_changed = False
 
     if cmd in ("/start", "/help"):
-        greeting = (
-            "<b>Welcome to AstroNews.</b>\n\n"
-            "I send a curated 6-hourly news digest based on topics you choose.\n\n"
-            + HELP_TEXT
-        )
-        send(token, chat_id, greeting if cmd == "/start" else HELP_TEXT)
-        if is_new:
-            state_changed = True  # new user row written
+        if cmd == "/start":
+            # New users get a default starter topic so their first digest isn't empty.
+            if is_new:
+                state_changed = True
+                for default in DEFAULT_TOPICS:
+                    if dbm.add_topic(conn, chat_id, default):
+                        pass  # event logged inside add_topic
+            current = dbm.get_topics(conn, chat_id)
+            suggested = [
+                t for t, _ in dbm.top_topics(conn, N_SUGGESTED_TOPICS + len(current))
+                if t not in current
+            ][:N_SUGGESTED_TOPICS]
+            parts = ["<b>Welcome to AstroNews.</b>",
+                     "I send a curated 6-hourly news digest based on topics you follow."]
+            if current:
+                parts.append("")
+                parts.append(f"<b>Your watchlist</b> ({len(current)}/{MAX_TOPICS_PER_USER}):")
+                parts.extend(f"• {t}" for t in current)
+            if suggested:
+                parts.append("")
+                parts.append("<b>Popular topics you might add:</b>")
+                parts.extend(f"• {s}" for s in suggested)
+                parts.append("Add any with <code>/add &lt;topic&gt;</code>.")
+            parts.append("")
+            parts.append(HELP_TEXT)
+            send(token, chat_id, "\n".join(parts))
+        else:
+            send(token, chat_id, HELP_TEXT)
 
     elif cmd == "/watchlist":
         topics = dbm.get_topics(conn, chat_id)

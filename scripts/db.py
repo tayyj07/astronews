@@ -182,6 +182,16 @@ def all_active_topics(conn: sqlite3.Connection) -> list[str]:
     return [r["topic"] for r in rows]
 
 
+def top_topics(conn: sqlite3.Connection, limit: int = 3) -> list[tuple[str, int]]:
+    """Most-followed topics across all users."""
+    rows = conn.execute(
+        "SELECT topic, COUNT(*) AS c FROM user_topics "
+        "GROUP BY topic ORDER BY c DESC, topic LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [(r["topic"], r["c"]) for r in rows]
+
+
 # --- per-user dedup --------------------------------------------------------
 
 def has_seen_url(conn: sqlite3.Connection, chat_id: int, url: str) -> bool:
