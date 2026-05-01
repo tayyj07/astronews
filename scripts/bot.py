@@ -258,6 +258,7 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             return
         if dbm.add_topic(conn, chat_id, arg):
             state_changed = True
+            dbm.refresh_user_label(conn, chat_id, username, first_name)
             send(token, chat_id,
                  f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).")
 
@@ -283,6 +284,7 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             return
         if dbm.remove_topic(conn, chat_id, target):
             state_changed = True
+            dbm.refresh_user_label(conn, chat_id, username, first_name)
             send(token, chat_id, f"Removed <i>{target}</i>.")
 
     else:

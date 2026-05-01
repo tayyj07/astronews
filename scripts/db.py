@@ -107,8 +107,9 @@ def upsert_user(conn: sqlite3.Connection, chat_id: int, username: str | None,
                 first_name: str | None) -> bool:
     """Insert user if missing. Returns True if newly inserted, False if existed.
 
-    Does NOT update last_seen_at on every call — that would force a git push
-    per read-only command. last_seen_at is only stamped on first insert.
+    Does NOT update existing rows here — that would cause every read-only
+    command (e.g. /watchlist) to dirty the DB and force a git push. Use
+    refresh_user_label() from a write-path command instead.
     """
     existing = conn.execute(
         "SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,)
@@ -122,6 +123,29 @@ def upsert_user(conn: sqlite3.Connection, chat_id: int, username: str | None,
         )
         return True
     return False
+
+
+def refresh_user_label(conn: sqlite3.Connection, chat_id: int,
+                       username: str | None, first_name: str | None) -> bool:
+    """Refresh the cached username/first_name for an existing user.
+
+    Returns True if anything actually changed. Call from write-path command
+    handlers (/add, /remove) where a git push is already happening — this
+    keeps the display label fresh without adding new pushes.
+    """
+    row = conn.execute(
+        "SELECT username, first_name FROM users WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    if row["username"] == username and row["first_name"] == first_name:
+        return False
+    conn.execute(
+        "UPDATE users SET username = ?, first_name = ?, last_seen_at = ? "
+        "WHERE chat_id = ?",
+        (username, first_name, now_utc(), chat_id),
+    )
+    return True
 
 
 def all_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
