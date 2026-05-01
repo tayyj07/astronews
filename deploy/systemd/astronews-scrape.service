@@ -1,0 +1,14 @@
+[Unit]
+Description=AstroNews scraper — fetch watched sources, queue new posts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=astronews
+Group=astronews
+WorkingDirectory=/home/astronews/astronews
+ExecStart=/usr/bin/python3 /home/astronews/astronews/scripts/scrape.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300

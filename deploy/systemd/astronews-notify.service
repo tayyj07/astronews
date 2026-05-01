@@ -1,0 +1,14 @@
+[Unit]
+Description=AstroNews Telegram notifier — pushes new digests to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=astronews
+Group=astronews
+WorkingDirectory=/home/astronews/astronews
+ExecStart=/usr/bin/python3 /home/astronews/astronews/scripts/notify.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120

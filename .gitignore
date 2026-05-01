@@ -2,3 +2,5 @@
 .claude/
 __pycache__/
 *.pyc
+# Per-runtime notifier state — each VPS / device tracks its own sent digests.
+state/notified.json
