@@ -13,3 +13,5 @@ state/bot_offset.txt
 state/astronews.db
 state/astronews.db-wal
 state/astronews.db-shm
+# Python virtualenv on the VPS for the classify script's anthropic SDK
+.venv/

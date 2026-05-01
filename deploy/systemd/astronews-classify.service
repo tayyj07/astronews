@@ -1,0 +1,14 @@
+[Unit]
+Description=AstroNews atom classifier — Anthropic API on VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=astronews
+Group=astronews
+WorkingDirectory=/home/astronews/astronews
+ExecStart=/home/astronews/astronews/.venv/bin/python3 /home/astronews/astronews/scripts/classify.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300

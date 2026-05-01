@@ -21,6 +21,8 @@ install -m 644 "$SRC"/astronews-notify.timer          "$DEST/"
 install -m 644 "$SRC"/astronews-bot.service           "$DEST/"
 install -m 644 "$SRC"/astronews-admin-report.service  "$DEST/"
 install -m 644 "$SRC"/astronews-admin-report.timer    "$DEST/"
+install -m 644 "$SRC"/astronews-classify.service      "$DEST/"
+install -m 644 "$SRC"/astronews-classify.timer        "$DEST/"
 
 systemctl daemon-reload
 
