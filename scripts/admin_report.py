@@ -117,11 +117,7 @@ def main() -> int:
         lines.append("")
         lines.append("<b>New atoms (last 24h):</b>")
         for a in new_atoms:
-            who = a["created_by"] or "—"
-            lines.append(
-                f"• <code>{a['atom_id']}</code> [{a['kind']}] — "
-                f"{html.escape(a['description'])} <i>(by {who})</i>"
-            )
+            lines.append(f"• <code>{a['atom_id']}</code>")
 
     if dup_pairs:
         lines.append("")
@@ -130,24 +126,7 @@ def main() -> int:
             lines.append(f"• <code>{a}</code> ↔ <code>{b}</code>  (edit distance {d})")
         lines.append("Use <code>/admin merge &lt;keep&gt; &lt;drop&gt;</code> to merge.")
 
-    if events:
-        lines.append("")
-        lines.append("<b>Topic events (last 24h):</b>")
-        # Group by chat_id
-        by_user: dict = {}
-        for e in events:
-            by_user.setdefault(e["chat_id"], []).append(e)
-        for cid, evs in by_user.items():
-            user = conn.execute(
-                "SELECT username FROM users WHERE chat_id = ?", (cid,)
-            ).fetchone()
-            uname = user["username"] if user and user["username"] else str(cid)
-            lines.append(f"• <b>@{uname}</b>:")
-            for e in evs[-10:]:
-                sign = "＋" if e["action"] == "add" else "−"
-                lines.append(f"   {sign} {html.escape(e['topic'])}")
-
-    if not new_atoms and not dup_pairs and not events:
+    if not new_atoms and not dup_pairs:
         lines.append("")
         lines.append("<i>Nothing new since yesterday.</i>")
 
