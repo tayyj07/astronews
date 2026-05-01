@@ -281,12 +281,10 @@ def fmt_sources(sources: list, max_cap: int) -> str:
 
 
 def parse_addsource_arg(arg: str, current_topics: list[str]) -> tuple[str | None, str | None]:
-    """Parse the `/addsource` argument. Accepts:
+    """Parse the `/addsource` argument. Space-separated; no arrow syntax.
         <url>
-        <url> <n>                # route to topic #n from /watchlist
-        <url> <topic-text>       # route to topic by exact text
-        <url> -> <n|topic-text>  # arrow optional, both forms work
-        <url> → <n|topic-text>   # unicode arrow also fine
+        <url> <n>            # route to topic #n from /watchlist
+        <url> <topic-text>   # route to topic by exact text
     Returns (url, topic_text_or_None).
     """
     arg = arg.strip()
@@ -297,10 +295,6 @@ def parse_addsource_arg(arg: str, current_topics: list[str]) -> tuple[str | None
     if len(parts) == 1:
         return url, None
     rest = parts[1].strip()
-    for sep in ("→", "->"):
-        if rest.startswith(sep):
-            rest = rest[len(sep):].strip()
-            break
     if not rest:
         return url, None
     # If the rest is a small integer, treat as a topic-number reference.
@@ -308,8 +302,7 @@ def parse_addsource_arg(arg: str, current_topics: list[str]) -> tuple[str | None
         idx = int(rest) - 1
         if 0 <= idx < len(current_topics):
             return url, current_topics[idx]
-        # Number out of range — fall through; user may have meant a topic
-        # text that happens to be numeric, or the number is just wrong.
+        # Number out of range — fall through to text matching.
     return url, rest
 
 
