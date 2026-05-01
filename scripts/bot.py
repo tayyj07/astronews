@@ -275,8 +275,7 @@ def handle_command(token: str, conn, chat_id: int, username: str | None,
             state_changed = True
             dbm.refresh_user_label(conn, chat_id, username, first_name)
             send(token, chat_id,
-                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).\n"
-                 "<i>Atom classification will run in the next routine cycle (within 6h).</i>")
+                 f"Added <i>{arg}</i>. You now follow {len(current)+1} topic(s).")
 
     elif cmd == "/remove":
         if not arg:
