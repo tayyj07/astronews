@@ -1,0 +1,20 @@
+[Unit]
+Description=AstroNews Telegram bot — long-polls /watchlist /add /remove
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astronews
+Group=astronews
+WorkingDirectory=/home/astronews/astronews
+ExecStart=/usr/bin/python3 /home/astronews/astronews/scripts/bot.py
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+# The bot acquires the shared flock per-update from inside Python; no
+# wrapping flock here (would hold the lock for the service's whole lifetime).
+
+[Install]
+WantedBy=multi-user.target

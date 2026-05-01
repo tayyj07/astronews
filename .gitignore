@@ -2,5 +2,10 @@
 .claude/
 __pycache__/
 *.pyc
-# Per-runtime notifier state — each VPS / device tracks its own sent digests.
+# Per-runtime notifier state — replaced by DB tables but kept ignored for safety.
 state/notified.json
+# Bot's last-seen Telegram update_id — VPS-local cursor, not shared.
+state/bot_offset.txt
+# SQLite WAL/SHM sidecars — only the .db file is committed.
+state/astronews.db-wal
+state/astronews.db-shm

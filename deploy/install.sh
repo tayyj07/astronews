@@ -18,6 +18,7 @@ install -m 644 "$SRC"/astronews-scrape.service  "$DEST/"
 install -m 644 "$SRC"/astronews-scrape.timer    "$DEST/"
 install -m 644 "$SRC"/astronews-notify.service  "$DEST/"
 install -m 644 "$SRC"/astronews-notify.timer    "$DEST/"
+install -m 644 "$SRC"/astronews-bot.service     "$DEST/"
 
 systemctl daemon-reload
 
@@ -29,5 +30,7 @@ cat <<EOF
 Next steps (after the credentials file is in place and a manual test passes):
   systemctl enable --now astronews-scrape.timer
   systemctl enable --now astronews-notify.timer
+  systemctl enable --now astronews-bot.service
   systemctl list-timers astronews-*
+  systemctl status astronews-bot.service
 EOF
