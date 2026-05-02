@@ -5,6 +5,7 @@
 claude design news
 ethereum
 hyperliquid
+ritual net autonomous ai intelligence
 solana
 stablecoins
 stablecoins development in the tradfi space
